@@ -1,0 +1,1016 @@
+Title   hook C-A-D-reboot message in kbdbase.sys and post an event semaphore
+
+;ÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍ
+
+; Veit Kannegieser 2003.03.27
+;
+; Dietrich Teickner 2003.05.30..2003.06.11
+;   * Warp 4 fp12 compatible (kbdbase.sys has other jump)
+;   * added sti command for high cpu load?
+;   * allocate context hook only after successful search for patch code
+;   * protect driver for only one basedev init command
+;   * optimisations
+;
+; Veit Kannegieser 2003.06.19
+;   * minor modifications for personal taste, documentation
+;
+; Veit Kannegieser 2004.08.18
+;   * added resource manager include and calls
+; Veit Kannegieser 2005.02.09
+;   * changed filter to filter/patch Device_Help address instead of code
+;   * filter any SendEvent Device_Help call from kbdbase.sys
+;   * allow more than one driver open - even for the same hook!
+;     last found applicable hook is handled
+;
+; Veit Kannegieser 2006.01.31
+;   * forced local labels to be local using @@
+;   * used symbolic constants from include files
+;   * warning when KBDBASE.SYS hotkey table can not be found
+
+                        .486p
+                        locals @@
+
+                        include def.inc
+
+data                    Segment 'data' use16 public
+data                    EndS
+code                    Segment 'code' use16 public
+code                    EndS
+
+dgroup                  Group data
+cgroup                  Group code
+
+;ÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍ
+
+data                    Segment
+
+                        include datum.inc
+                        include devhdr.inc      ; toolkit
+                        include devcmd.inc      ; toolkit
+
+                        dd -1
+                        ; 8000-15 char dev
+                        ; 0800-11 need open/close command
+                        ; 0180-8/7 capabilities bit strip
+                        dw DEV_CHAR_DEV+DEV_30+DEVLEV_3
+                        dw Offset cadh_strategy
+                        dw -1
+                        db 'CADH$$$$'
+                        dw 4 dup (0)
+                        dd DEV_16MB             ; >16MB address ok
+
+Device_Help             dd 0
+my_contexthook          dd 0
+
+filter_entry            Struc
+  SystemFileNumber      dw ?
+  SystemEventSemHandle  dd ?
+  Event                 db ?
+  Event_Mask            db ?
+  Argument              dw ?
+  Argument_Mask         dw ?
+  triggered             db ?
+filter_entry            EndS
+
+number_of_filters       equ 1+16 ; one for CAD and for each SM hotkey
+
+filter_table            db number_of_filters*(type filter_entry) dup (0)
+filter_table_end:
+
+data_lock               dw 0
+initdone                db false
+
+hotkey_table            PTR1616 <0,0>
+
+end_resident_data       label byte
+
+drivername_KBDBASE      db 'KBD$    '
+Attach_Table            AttachTable <>
+
+Message_table           dw 1178 ; "%1"  ; message number
+                        dw 1            ; one paramter
+fillin_string_ofs       dw ?            ; first fill in item
+                        dw data
+
+quiet                   db false
+verbose                 db false
+wait                    db false
+
+error_parametererror            db 'CADH: parameter error',0
+error_update_devicehelp_jmp     db 'CADH: Can not create DeviceHelp jump',0
+error_can_not_attach_kbdbase_sys db 'CADH: Can not attach to KDBBASE.SYS',0
+error_kbdbase_ds_invalid        db 'CADH: KBDBASE.SYS data segment is invalid',0
+error_patchloc_not_found        db 'CADH: Patch location in KBDBASE.SYS not found',0
+warning_hotkeytable_not_found   db 'CADH: Hotkey table in KBDBASE.SYS not found',0
+error_alloc_contexthook         db 'CADH: Failed to allocate Context Hook',0
+message_success                 db 'CADH: successfully installed',0
+message_pause                   db 'SYS    : end of CADH report',0
+
+Public                  Device_Help
+Public                  my_contexthook
+Public                  filter_table
+Public                  filter_table_end
+Public                  data_lock
+Public                  initdone
+Public                  hotkey_table
+
+Public                  drivername_KBDBASE
+Public                  Attach_Table
+Public                  Message_table
+Public                  fillin_string_ofs
+Public                  quiet, verbose, wait
+
+
+                        include datum.inc
+                        include resmgrd.inc
+                        include resmgrdi.inc
+
+data                    EndS
+
+;ÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍ
+
+code                    Segment
+                        assume cs:code
+                        assume ds:data
+
+                        include devhlp.inc
+
+                        ; called from kbdbase.sys
+a_proc                  DeviceHelpFilter
+                        pushf
+
+                          cmp dl,DevHlp_SendEvent
+                          jne @@forward_DeviceHelpCall
+
+                          push ds
+                          pushad
+
+                            push data
+                            pop ds
+
+                            ; ah=event,bx=argument..
+
+                            sub di,di
+                            mov si,Offset filter_table
+  @@search_match_loop:
+                            ; in use?
+                            cmp ds:[si].SystemFileNumber,0
+                            je @@search_match_break
+                            ; sempaphore good?
+                            cmp ds:[si].SystemEventSemHandle,0
+                            je @@search_match_next
+                            ; event match?
+                            mov dl,ah
+                            and dl,ds:[si].Event_Mask
+                            cmp dl,ds:[si].Event
+                            jne @@search_match_next
+                            ; argument match?
+                            mov dx,bx
+                            and dx,ds:[si].Argument_Mask
+                            cmp dx,ds:[si].Argument
+                            jne @@search_match_next
+                            ; remember last found entry
+                            mov di,si
+  @@search_match_next:
+                            add si,type filter_entry
+                            cmp si,Offset filter_table_end
+                            jne @@search_match_loop
+  @@search_match_break:
+
+                            test di,di
+                            jz @@forward_DeviceHelpCall_pop
+
+                            mov [di].triggered,true
+
+                            ; arm context hook, pass entry as an parameter
+                            sub eax,eax                 ; any data=none
+                            mov ebx,[my_contexthook]    ; context handle
+                            or ecx,-1                   ; reserved value
+                            mov dl,DevHlp_ArmCtxHook
+                            sti                         ; unsure..
+                            call [Device_Help]
+                                                        ; ignore errors
+
+                            ; call filtered - return to kbdbase.sys
+                          popad
+                          pop ds
+                        popf
+                        clc                     ; claim success
+                        retf
+
+  @@forward_DeviceHelpCall_pop:
+                          popad
+                          pop ds
+  @@forward_DeviceHelpCall:
+                        popf
+                        ; jmp forward to DeviceHelp
+                        ; ->
+                        db 0eah
+  DeviceHelp_fillin     dd ?
+a_endp                  DeviceHelpFilter
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+                        ; later, from context hook
+a_proc                  context_hook_handler
+                        pushf
+                        push ds
+                        pushad
+
+                          push data
+                          pop ds
+
+                          call lock_table
+
+                          mov si,Offset filter_table
+  @@search_triggered_loop:
+                          ; in use?
+                          cmp ds:[si].SystemFileNumber,0
+                          je @@search_triggered_next
+                          ; sempaphore good?
+                          cmp ds:[si].SystemEventSemHandle,0
+                          je @@search_triggered_next
+
+                          mov al,false
+                          xchg ds:[si].triggered,al
+                          cmp al,true
+                          jne @@search_triggered_next
+
+                          ; post associated semaphore
+                          mov eax,[si].SystemEventSemHandle
+                          mov dl,DevHlp_PostEventSem
+                          call unlock_table
+                          sti                 ; unsure..
+                          call [Device_Help]
+                                              ; ignore errors
+                          call lock_table
+  @@search_triggered_next:
+                          add si,type filter_entry
+                          cmp si,Offset filter_table_end
+                          jne @@search_triggered_loop
+
+                          call unlock_table
+                        popad
+                        pop ds
+                        popf
+                        retf
+a_endp                  context_hook_handler
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+a_proc                  lock_table
+                        pushf
+  @@loop:
+                          bts [data_lock],0
+                          jnc @@exit
+                          nop                   ; <- better wait/yield??
+                          jmp @@loop
+  @@exit:
+                        popf
+                        ret
+a_endp                  lock_table
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+a_proc                  unlock_table
+                        mov [data_lock],0
+                        ret
+a_endp                  unlock_table
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+                        ; si=filter entry
+                        ; data lock on
+a_proc                  release_filter
+                        push es
+                        pushad
+
+                          sub eax,eax
+                          xchg [si].SystemEventSemHandle,eax
+                          mov dl,DevHlp_CloseEventSem
+                          call [Device_Help]
+
+                          push ds
+                          pop es
+                          mov di,si
+                          add si,type filter_entry
+                          mov cx,Offset filter_table_end
+                          sub cx,si
+                          cld
+                          rep movsb
+
+                          mov al,0
+                          mov cx,type filter_entry
+                          rep stosb
+
+                        popad
+                        pop es
+                        ret
+a_endp                  release_filter
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+                        ; data lock on
+                        ; eax=semaphore handle
+                        ; bp=SystemFileNumber
+                        ; cx=event(lo)/event mask(hi)
+                        ; edx=argument(lo)/argument mask(hi)
+                        ; -> CF
+a_proc                  allocate_filter
+                        pushad
+
+                          mov si,Offset filter_table
+    @@loop:
+                          cmp [si].SystemFileNumber,0
+                          jne @@next
+
+                          ; have free slot, open semaphore
+                          push eax
+                          push dx
+                         ;mov eax,eax
+                          mov dl,DevHlp_OpenEventSem
+                          call [Device_Help]
+                          pop dx
+                          pop eax
+                          jc @@exit             ; CF=1
+
+                          mov Word Ptr [si].Event,cx
+                          mov DWord Ptr [si].Argument,edx
+                          mov [si].triggered,false
+                          mov [si].SystemEventSemHandle,eax
+                          mov [si].SystemFileNumber,bp
+                          clc
+                          jmp @@exit            ; CF=0
+  @@next:
+                          add si,type filter_entry
+                          cmp si,Offset filter_table_end
+                          jne @@loop
+
+                          ; no free entry
+                          stc                           ; CF=1
+  @@exit:
+
+                        popad
+                        ret
+a_endp                  allocate_filter
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+                        ; es:RequestBlock_10[bx].RGI_Parameter_Buffer
+                        ; cx=length
+                        ; -> CF
+a_proc                  verify_parameter
+                        pusha
+                          mov ax,es:RequestBlock_10[bx].RGI_Parameter_Buffer._SEG
+                          mov di,es:RequestBlock_10[bx].RGI_Parameter_Buffer._OFF
+                          mov dh,1              ; read+write
+                          mov dl,DevHlp_VerifyAccess
+                          call [Device_Help]
+                        popa
+                        ret
+a_endp                  verify_parameter
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+a_proc                  cadh_strategy
+                        mov al,es:RequestBlock[bx].Command_Code
+
+                        ;--------------------------------------------
+                        ; allow may open instances
+                        cmp al,CMDOpen
+                        je @@exit_no_error              ; ok
+
+                        ; verify close and free resources if needed
+                        cmp al,CMDClose
+                        jne @@not_CMDClose
+
+                        call lock_table
+                        ; dx=unique handle
+                        mov bp,es:RequestBlock_0d[bx].ROC_System_File_Num
+                        mov si,Offset filter_table_end
+  @@close_loop:
+                        sub si,type filter_entry
+                        ; filter is for closing application?
+                        cmp [si].SystemFileNumber,bp
+                        jne @@close_next
+                        call release_filter
+  @@close_next:
+                        cmp si,Offset filter_table
+                        jne @@close_loop
+
+                        call unlock_table
+                        jmp @@exit_no_error             ; ok
+
+  @@not_CMDClose:
+                        ;--------------------------------------------
+
+                        ;--------------------------------------------
+                        ; generic ioctl does event hook/remove
+                        cmp al,CMDGenIOCTL
+                        jne @@not_generic_ioctl
+                        ; category 80?
+                        cmp es:RequestBlock_10[bx].RGI_Function_Category,080h
+                        jne @@not_my_generic_ioctl
+                        ; parameter nil?
+                        test es:RequestBlock_10[bx].RGI_Parameter_Buffer._SEG,0fffch
+                        jz @@parameter_error
+
+                        ; function 0,1,2,3?
+                        movzx si,es:RequestBlock_10[bx].RGI_Function_Code
+                        shl si,1
+                        cmp si,(Offset @@jumptable_my_ioctl_end)-(Offset @@jumptable_my_ioctl)
+                        jae @@not_my_generic_ioctl
+                        jmp @@jumptable_my_ioctl[si]
+  @@jumptable_my_ioctl  dw Offset @@ioctl_register_eventsem
+                        dw Offset @@ioctl_deregister_eventsem
+                        dw Offset @@ioctl_register_eventsem_enhanced
+                        dw Offset @@ioctl_deregister_eventsem_enhanced
+                        dw Offset @@ioctl_modify_priority
+                        dw Offset @@ioctl_kill_proc
+                        dw Offset @@ioctl_setsesmgrhotkey
+  @@jumptable_my_ioctl_end:
+
+                        Public @@ioctl_register_eventsem
+                        Public @@ioctl_deregister_eventsem
+                        Public @@ioctl_register_eventsem_enhanced
+                        Public @@ioctl_deregister_eventsem_enhanced
+                        Public @@ioctl_modify_priority
+                        Public @@ioctl_kill_proc
+                        Public @@ioctl_setsesmgrhotkey
+
+                        ;--------------------------------------------
+                        ; 0=register(old:CAD only)
+  @@ioctl_register_eventsem:
+                        mov cx,4
+                        call verify_parameter
+                        jc @@parameter_error
+
+                        push ds
+                          lds si,es:RequestBlock_10[bx].RGI_Parameter_Buffer
+                          mov eax,ds:[si]
+                          mov cx,0ff07h         ; reboot key (exact/reboot)
+                          sub edx,edx           ; ignore argument
+                        pop ds
+  @@continue_register_eventsem:
+                        call lock_table
+                        mov bp,es:[bx].RGI_System_File_Num
+                        call allocate_filter
+                        call unlock_table
+
+                        jnc @@exit_no_error     ; out of resources..?
+  @@alread_in_use:
+                        mov ax,08114h           ; error+done+already in use
+                        jmp @@exit_strategy
+                        ;--------------------------------------------
+
+                        ;--------------------------------------------
+                        ; 1=deregister(old:CAD only)
+  @@ioctl_deregister_eventsem:
+                        mov cx,4
+                        call verify_parameter
+                        jc @@parameter_error
+
+                        push ds
+                          lds si,es:RequestBlock_10[bx].RGI_Parameter_Buffer
+                          mov eax,ds:[si]
+                          mov cx,0ff07h         ; reboot key (exact/reboot)
+                          sub edx,edx           ; ignore argument
+                        pop ds
+
+  @@continue_deregister_eventsem:
+
+                        call lock_table
+                        mov bp,es:[bx].RGI_System_File_Num
+                        mov si,Offset filter_table_end
+                        sub di,di
+  @@deregister_loop:
+                        sub si,type filter_entry
+                        ; compare filter attributes
+                        cmp [si].SystemFileNumber,bp
+                        jne @@deregister_next
+                        cmp [si].SystemEventSemHandle,eax
+                        jne @@deregister_next
+                        cmp Word Ptr [si].Event,cx
+                        jne @@deregister_next
+                        cmp DWord Ptr [si].Argument,edx
+                        jne @@deregister_next
+
+                        call release_filter
+                        inc di
+  @@deregister_next:
+                        cmp si,Offset filter_table
+                        jne @@deregister_loop
+
+                        call unlock_table
+
+                        test di,di
+                        jz @@parameter_error    ; nothing found
+                        jmp @@exit_no_error
+                        ;--------------------------------------------
+
+                        ;--------------------------------------------
+                        ; 2=register-enhanced version
+  @@ioctl_register_eventsem_enhanced:
+                        mov cx,4+1+1+2+2
+                        call verify_parameter
+                        jc @@parameter_error
+
+                        push ds
+                          lds si,es:RequestBlock_10[bx].RGI_Parameter_Buffer
+                          mov eax,ds:[si]
+                          mov cx,ds:[si+4]      ; event
+                          mov edx,ds:[si+6]     ; argument
+                        pop ds
+
+                        jmp @@continue_register_eventsem
+                        ;--------------------------------------------
+
+                        ;--------------------------------------------
+                        ; 3=deregister-enhanced version
+  @@ioctl_deregister_eventsem_enhanced:
+                        mov cx,4+1+1+2+2
+                        call verify_parameter
+                        jc @@parameter_error
+
+                        push ds
+                          lds si,es:RequestBlock_10[bx].RGI_Parameter_Buffer
+                          mov eax,ds:[si]
+                          mov cx,ds:[si+4]      ; event
+                          mov edx,ds:[si+6]     ; argument
+                        pop ds
+
+                        jmp @@continue_deregister_eventsem
+                        ;--------------------------------------------
+
+                        ;--------------------------------------------
+                        ; 4=modify priority bx=thread slot? dh=0/xx?
+  @@ioctl_modify_priority:
+
+; not useful for our purpose?
+;                       mov cx,2+1
+;                       call verify_parameter
+;                       jc @@parameter_error
+;
+;                       push bx
+;                         push ds
+;                           lds si,es:RequestBlock_10[bx].RGI_Parameter_Buffer
+;                           mov bx,ds:[si]
+;                           mov dh,ds:[si+2]
+;                         pop ds
+;
+;                         ; seem to be no other registers
+;                         mov dl,DevHlp_Modify_Priority
+;                         call [Device_Help]
+;
+;                       pop bx
+;                       jnc @@exit_no_error
+                        jmp @@general_failure
+                        ;--------------------------------------------
+
+                        ;--------------------------------------------
+                        ; 5=kill process (os2devhlp.htm#kill)
+  @@ioctl_kill_proc:
+                        mov cx,2
+                        call verify_parameter
+                        jc @@parameter_error
+
+                        push ds
+                        push bx
+                        push gs
+                          push ds
+                          pop gs
+                          lds si,es:RequestBlock_10[bx].RGI_Parameter_Buffer
+                          mov bx,ds:[si]
+
+                          mov ax,303            ; Error_Invalid_Procid
+                          cmp bx,12+1           ; imitate FASTIO$ safety
+                          jb @@skip_kill_proc   ; CF=1
+
+                          mov dl,DevHlp_KillProc ; eax!
+                          call gs:[Device_Help]
+  @@skip_kill_proc:
+
+                        pop gs
+                        pop bx
+                        pop ds
+                        jnc @@exit_no_error
+
+                        cmp ax,13               ; Error_Invalid_Data
+                        je @@parameter_error
+                       ;cmp ax,217              ; Error_Zombie_Process
+                       ;je @@general_failure
+                        cmp ax,303              ; Error_Invalid_Procid
+                        je @@parameter_error
+                        cmp ax,305              ; Error_Not_Descendant
+                        je @@parameter_error
+                        jmp @@general_failure
+                        ;--------------------------------------------
+
+                        ;--------------------------------------------
+                        ; 6=KBD$/IOCTL_KEYBOARD/KBD_SETSESMGRHOTKEY
+                        ; for non-Sessionmanager programs
+  @@ioctl_setsesmgrhotkey:
+                        ; can only support this function,
+                        ; if table address is known
+                        cmp hotkey_table,0
+                        je @@not_my_generic_ioctl
+
+                        mov cx,type hotkey
+                        call verify_parameter
+                        jc @@parameter_error
+
+                        push ds
+                          lds si,es:RequestBlock_10[bx].RGI_Parameter_Buffer
+                          mov bp,ds:[si]        ; state
+                          mov ax,ds:[si+2]      ; make(lo)/break(hi)
+                          mov dx,ds:[si+4]      ; hotkey id
+                        pop ds
+
+                        cmp dx,1                ; hotkey 0001..fffe?
+                        jb @@parameter_error
+                        cmp dx,0fffeh
+                        ja @@parameter_error
+
+                        test bp,not 00f03h      ; reserved shift bits must be 0
+                        jnz @@parameter_error
+                        cmp ah,0                ; no break
+                        je @@parameter_error
+                        cmp al,0                ; no make
+                        je @@parameter_error
+
+                        push ds
+                        pushf
+                          cli
+
+                          ; check that no different hotkey uses same definition
+                          lds si,hotkey_table
+                          mov di,si
+                          mov cx,16
+  @@check_all_hotkey_enties_loop:
+                          cmp [si].idHotKey,dx                  ; may be equal, ignore
+                          je @@check_all_hotkey_enties_next
+                          cmp [si].fsHotKey,bp
+                          jne @@check_all_hotkey_enties_next
+                          cmp Word Ptr [si].uchScancodeMake,ax
+                          jne @@check_all_hotkey_enties_next
+
+                        popf
+                        pop ds
+                        jmp @@parameter_error
+
+  @@check_all_hotkey_enties_next:
+                          add si,type hotkey
+                          loop @@check_all_hotkey_enties_loop
+
+
+                          ; search existing hotkey ID or free slot
+                          sub si,di
+                          mov cx,16
+  @@search_free_hotkey_slot_loop:
+                          cmp [si].idHotKey,dx                  ; replace it
+                          je @@check_all_hotkey_enties_replace
+                          cmp [si].idHotKey,0                   ; new entry
+                          jne @@search_free_hotkey_slot_next
+                          cmp [si].fsHotKey,0
+                          jne @@search_free_hotkey_slot_next
+                          cmp Word Ptr [si].uchScancodeMake,0
+                          jne @@search_free_hotkey_slot_next
+
+                          ; KBDDATA.ASM: HotKeyCount
+                          inc Byte Ptr [di+16*(type hotkey)]
+
+  @@check_all_hotkey_enties_replace:
+                          mov [si].idHotKey,dx
+                          mov [si].fsHotKey,bp
+                          mov Word Ptr [si].uchScancodeMake,ax
+                          clc
+                          jmp @@search_free_hotkey_slot_break
+
+  @@search_free_hotkey_slot_next:
+                          add si,type hotkey
+                          loop @@search_free_hotkey_slot_loop
+                          stc
+  @@search_free_hotkey_slot_break:
+
+                        popf
+                        pop ds
+                        jnc @@exit_no_error
+                        jmp @@general_failure
+  @@not_generic_ioctl:
+  @@not_my_generic_ioctl:
+                        ;--------------------------------------------
+
+                        ;--------------------------------------------
+                        ; at last, we check for init command
+                        cmp al,CMDInitBase
+                        jne @@not_basedev_init
+                        cmp initdone,false
+                        jne @@not_basedev_init
+
+                        call init_basedev               ; seen in kbdbase.sys
+
+                        mov ax,08115h                   ; error+done+noncritical
+                        jc @@exit_strategy              ; only when failed
+  @@exit_no_error:
+                        mov ax,00100h                   ; no error+done
+  @@exit_strategy:
+                        mov es:RequestBlock[bx].Request_Packet_Status,ax
+                        retf
+
+  @@not_basedev_init:
+  @@basedev_init_not_valid:
+                        mov ax,08103h                   ; error+done+unknown command
+                        jmp @@exit_strategy
+  @@general_failure:
+                        mov ax,0810ch                   ; error+done+general failure
+                        jmp @@exit_strategy
+  @@parameter_error:
+                        mov ax,08113h                   ; error+done+bad parameter
+                        jmp @@exit_strategy
+
+a_endp                  cadh_strategy
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+end_resident_code       label byte
+
+                        include rmcall.inc
+                        include rmcdrvr.inc
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+; init-code
+; if init fail, will not keep in memory: set size 0
+
+a_proc                  init_basedev
+                        mov initdone,true
+
+                        sub eax,eax
+                        xchg eax,es:RequestBlock[bx].Pointer_1
+                        mov [Device_Help],eax
+
+                        call RegisterResourceManager
+
+                        push es
+                        push bx
+
+
+                          ; parse parameters
+                          lfs si,es:RequestBlock[bx].Pointer_2
+                          call find_skip_blank
+    @@skip_param:
+                          mov al,fs:[si]
+                          inc si
+
+                          cmp al,9
+                          je @@skip_param
+
+                          cmp al,' '
+                          je @@skip_param
+                          jb @@done_param
+
+                          cmp al,'-'
+                          je @@skip_param
+                          cmp al,'/'
+                          je @@skip_param
+
+                          and al,(not 020h)       ; upcase
+
+                          cmp al,'Q'
+                          jne @@not_param_q
+
+                          mov quiet,true
+                          jmp @@skip_param
+  @@not_param_q:
+                          cmp al,'V'
+                          jne @@not_param_v
+
+                          mov verbose,true
+                          jmp @@skip_param
+  @@not_param_v:
+                          cmp al,'W'
+                          jne @@not_param_w
+
+                          mov verbose,true
+                          mov wait,true
+                          jmp @@skip_param
+  @@not_param_w:
+                          mov fillin_string_ofs,Offset error_parametererror
+                          jmp @@init_fail
+
+  @@done_param:
+
+                          mov fillin_string_ofs,Offset error_update_devicehelp_jmp
+                          ; patch code to have fast jump to DeviceHelp
+                          ; yes, it is dirty, but other variants
+                          ; would risk using wrong registers during an
+                          ; DeviceHelp call..
+
+                          push ds
+                            push ds
+                            pop es
+                            push cs
+                            pop ds
+                            mov si,Offset DeviceHelp_fillin ; ds:si=@code
+                            mov dl,DevHlp_VirtToPhys
+                            call es:[Device_Help]
+                          pop ds
+                          jc @@init_fail
+                                                ; have physical ax:bx
+
+                         ;mov ax,ax             ; ax:bx physical
+                         ;mov bx,bx
+                          mov cx,4              ; 4 bytes to change
+                          mov dh,1              ; get result pointer to es:di
+                          mov dl,DevHlp_PhysToVirt
+                          call [Device_Help]
+
+                          ; patch...
+                          mov eax,[Device_Help]
+                          mov es:[di],eax
+
+                          ; attach to KBDBASE.SYS
+                          mov fillin_string_ofs,Offset error_can_not_attach_kbdbase_sys
+                          mov bx,Offset drivername_KBDBASE
+                          mov di,Offset Attach_Table
+                          mov dl,DevHlp_AttachDD
+                          call [Device_Help]
+                          jc @@init_fail
+
+                          mov fillin_string_ofs,Offset error_kbdbase_ds_invalid
+                          mov ax,[di].IDC_DS_ring0      ; data segment
+                          lsl cx,ax                     ; data segment size
+                          jnz @@init_fail
+                          sub cx,4                      ; do not search
+                          jb @@init_fail                ; past end of segment
+
+                          mov fillin_string_ofs,Offset error_patchloc_not_found
+                          sub si,si
+                          mov es,ax             ; kbdbase.sys data segment:0
+
+                          ; 1. Find hotkey table
+                          pusha
+
+  @@loop_search_hotkey_table:
+                            ; at ds:b1
+                            cmp DWord Ptr es:[si+ 0],09cbe9f9eh
+                            jne @@next_search_hotkey_table
+                            cmp DWord Ptr es:[si+ 4],0afab8badh
+                            jne @@next_search_hotkey_table
+                            cmp DWord Ptr es:[si+ 8],0a19cbeaeh
+                            jne @@next_search_hotkey_table
+                            cmp DWord Ptr es:[si+12],09f9fab8dh
+                            jne @@next_search_hotkey_table
+
+                            mov ax,si
+                            sub ax,2+1+(type hotkey)*16
+                            mov hotkey_table._OFF,ax
+                            mov hotkey_table._SEG,es
+                            sub cx,cx
+                            jmp @@break_search_hotkey_table
+
+  @@next_search_hotkey_table:
+                            inc si
+                            loop @@loop_search_hotkey_table
+
+                            mov fillin_string_ofs,Offset warning_hotkeytable_not_found
+                            call Display_Message
+
+                            ; fall trough: no error, just the hotkey_table is still NIL
+                            ; and we limit our functionality.
+
+  @@break_search_hotkey_table:
+
+                          popa
+
+                          ; 2. find DeviceHelp
+                          mov eax,Device_Help
+  @@loop_search_devhlp_addr:
+                          cmp DWord Ptr es:[si],eax
+                          je @@success_search_devhlp_addr
+                          inc si
+                          loop @@loop_search_devhlp_addr
+
+                          ; not found!
+  @@init_fail:
+                        pop bx
+                        pop es
+
+                        push es
+                        pushad
+
+                          push hDriver
+                          CallRM RMDestroyDriver
+                          add sp,4
+
+                        popad
+                        pop es
+
+                        call Display_Message
+
+                        stc                     ; fail
+                        jmp @@exit_init_basedev
+
+
+  @@success_search_devhlp_addr:
+                          ; allocate context hook after sequence found, not before
+                          mov fillin_string_ofs,Offset error_alloc_contexthook
+                          mov eax,Offset context_hook_handler
+                          or  ebx,-1            ; reserved value
+                          mov dl,DevHlp_AllocateCtxHook
+                          call [Device_Help]
+                          mov [my_contexthook],eax
+                          jc @@init_fail
+
+                          ; patch the DeviceHelp ptr in kbdbase.sys data
+                          ; to our filter procedure
+                          ; es=kbdbase.sys data si=@DeviceHelp
+                          mov es:[si]._OFF,Offset DeviceHelpFilter
+                          mov es:[si]._SEG,cs
+
+                        pop bx
+                        pop es
+
+                        ; set resident data/code size of cadh.sys
+                        mov es:RequestBlock[bx].Pointer_1,large 0
+                        org $-4
+                        PTR1616 <Offset end_resident_code-1,Offset end_resident_data-1>
+
+                        cmp verbose,true
+                        jne @@skip_message_success
+                        mov fillin_string_ofs,Offset message_success
+                        call Display_Message
+  @@skip_message_success:
+
+                        clc                     ; no error
+
+  @@exit_init_basedev:
+                        pushf
+                          cmp wait,true
+                          jne @@skip_message_pause
+                          mov fillin_string_ofs,Offset message_pause
+                          call Display_Message
+  @@skip_message_pause:
+                        popf
+
+                        ret                     ; done.
+a_endp                  init_basedev
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+a_proc                  Display_Message
+                        pusha
+                        push ds
+
+                          push Seg data
+                          pop ds
+
+                          cmp quiet,true
+                          je @@skip_Display_Message
+
+                          mov si,Offset Message_table
+                          sub bx,bx
+                          mov dl,DevHlp_Save_Message
+                          call [Device_Help]
+
+  @@skip_Display_Message:
+
+                        pop ds
+                        popa
+                        ret
+a_endp                  Display_Message
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+a_proc                  find_skip_blank
+                        push ax
+  @@loop:
+                          mov al,fs:[si]
+                          cmp al,9
+                          je @@skip_blank
+                          cmp al,' '
+                          je @@skip_blank
+                          jb @@exit
+                          inc si
+                          jmp @@loop
+  @@skip_blank:
+                          mov al,fs:[si]
+                          inc si
+                          cmp al,9
+                          je @@skip_blank
+                          cmp al,' '
+                          je @@skip_blank
+
+                          dec si
+  @@exit:
+                        pop ax
+                        ret
+a_endp                  find_skip_blank
+
+;ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ
+
+code                    EndS
+
+;ÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍ
+                        End
+

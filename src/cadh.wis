@@ -1,0 +1,126 @@
+<WarpIN>
+<Head>
+
+<REXX Name="use_directory">
+  rc = rxFuncAdd('SysLoadFuncs', 'REXXUTIL', 'SysLoadFuncs')
+  rc = SysLoadFuncs()
+
+  BootDrive = SysBootDrive()
+
+  Parse Arg fname1 dir2 .
+
+  /* fname1 is the name on eCS, where the file may already exist */
+  /* dir2 is the target directory for plain OS/2                 */
+
+  fname1 = BootDrive || fname1
+
+  dir1 = FileSpec('Drive', fname1) || FileSpec('Path', fname1)
+
+  /* remove trailing slash for non-root directories */
+  if Length(dir1) > Length('?:\') then
+    if SubStr(dir1,Length(dir1),1) == '\' then
+      dir1 = SubStr(dir1, 1, Length(dir1) - Length('\'))
+
+  /* add boot drive to dir2, if missing */
+  if SubStr(dir2, 1, 1) == '\' then
+    dir2 = BootDrive || dir2
+
+  /* use existing location, if possibble */
+  if Stream(fname1, 'C', 'Query Exist') <> '' then
+    Return dir1
+  else
+    Return dir2
+
+</REXX>
+
+<PCK Index=1
+     PackageId="Veit Kannegieser\CAD-Popup\CADH-Hook\2006\10\29"
+     Title="CAD-Handler: hook driver"
+     Target="=("use_directory \os2\boot \os2\boot")"
+     Fixed
+     Select
+     Nodeselect
+     ConfigSys="BaseDev=CADH.SYS | Unique(CADH.SYS)"
+     >CAD-Handler hook driver -- BASEDEV=CADH.SYS</PCK>
+
+<PCK Index=2
+     PackageId="Veit Kannegieser\CAD-Popup\CADH-Popup\2006\10\29"
+     Title="CAD-Handler: popup program"
+     Target="=("use_directory \ECS\BIN\cad_pop.exe $(WARPIN_DEFAULTTOOLSPATH)\cad_pop")"
+     <!-- Base -- when used, will cause package 1 to be installed to C:\ECS\BINC:\os2\boot -->
+     Select
+     CreateObject="REPLACE WPProgram|CADH Popup|<WP_START>|EXENAME=$(2)\cad_pop.exe;PROGTYPE=PROG_FULLSCREEN;STARTUPDIR=$(2);MINIMIZED=YES;MINWIN=HIDE;ICONFILE=$(2)\cad_pop.ico;OBJECTID=<CAD_POPUP>;"
+     >CAD-Handler popup program -- only CAD_POP.EXE and configuration files </PCK>
+
+<PCK Index=3
+     PackageId="Veit Kannegieser\CAD-Popup\CADH-Utils\2006\10\29"
+     Title="CAD-Handler: additional utils"
+     Target="=("use_directory \ECS\BIN\cad_pop.exe $(WARPIN_DEFAULTTOOLSPATH)\cad_pop")"
+     <!-- Select -->
+     >CAD-Handler additional utils - session manager hotkey definition and popup batch(rexx) file</PCK>
+
+<PCK Index=4
+     PackageId="Veit Kannegieser\CAD-Popup\CADH-Documentation\2006\10\29"
+     Title="CAD-Handler: Documentation"
+     Target="=("use_directory \ECS\DOC\CADH\cadh.txt $(WARPIN_DEFAULTTOOLSPATH)\cad_pop\doc")"
+     <!-- Select -->
+     >CAD-Handler plain text documentation</PCK>
+
+</Head>
+
+<Body>
+
+
+
+<Page Index=1 Type=Readme>
+<Text>
+</Text>
+<Readme Format=HTML>
+<p>Welcome to <B>CADH</B>,
+<p>this archive contains:
+<ul>
+<li>CADH.SYS - a driver that can replace actions taken on system hotkeys, like Ctrl+Alt+Del
+<li>CAD_POP - a menu popup program that uses CADH.SYS. It offers:
+<ul>
+<li>starting external programs like TOP or a command shell
+<li>unmounting/remounting filesystems
+<li>process/window list with options to close/kill windows/processes
+<li>restart system
+<li>reset WorkPlace Shell
+</ul>
+The menu can customized, you can password-protect the CAD_POP functions.<br>
+Translated to dutch, english, french, german, italien, russian and traditional chinese.
+</ul>
+<p>
+<p>
+<p>Author: Veit Kannegieser
+<p>e-mail: veit@kannegieser.net.
+<p>
+<p>program source: <a href="http://kannegieser.net/veit/quelle/#cadh.arj">http://kannegieser.net/veit/quelle/#cadh.arj</a>
+<p>
+</README>
+</PAGE>
+
+
+<Page Index=2 Type=Container>
+<Text>
+</Text>
+</Page>
+
+
+<Page Index=3 Type=Configure>
+<Text>Ready to install.
+
+CONFIG.SYS change will be basedev=cadh.sys,
+WPS object will be placed into the startup folder.
+
+When WarpIN will prompt you for CAD_POP.EXE
+beeing in use, please select the choice 'Unlock'.
+
+</Text>
+<NextButton Target=0>I~nstall</NextButton>
+</Page>
+
+
+</Body>
+</WarpIN>
